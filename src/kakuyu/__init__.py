@@ -1,3 +1,3 @@
-from .login import AuthResult, Kakuyu, LoginResult
+from .login import AuthResult, Kakuyu, LoginResult, SeikyuRecord, SeikyuResult
 
-__all__ = ["Kakuyu", "LoginResult", "AuthResult"]
+__all__ = ["Kakuyu", "LoginResult", "AuthResult", "SeikyuRecord", "SeikyuResult"]

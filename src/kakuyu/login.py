@@ -1,11 +1,12 @@
 import html
 import http.cookiejar
+from html.parser import HTMLParser
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 origin = "https://gaihaku-maizuru.mogsmile.com"
@@ -13,6 +14,7 @@ _INIT_PATH = "/gaihaku/student/login!init.action"
 _TLOGIN_INIT_PATH = "/gaihaku/student/tlogin!init.action"
 _TLOGIN_ACTION_PATH = "/gaihaku/student/tlogin.action"
 _REGIST_INIT_PATH = "/gaihaku/student/regist/regist!init.action"
+_SEIKYU_INIT_PATH = "/gaihaku/student/seikyu/seikyu!init.action"
 _TOKEN_RE = re.compile(
     r"<input\b(?=[^>]*\bname\s*=\s*['\"]token['\"])"
     r"(?=[^>]*\bvalue\s*=\s*(['\"])(.*?)\1)[^>]*>",
@@ -38,6 +40,22 @@ class AuthResult:
     message: str = ""
 
 
+@dataclass
+class SeikyuRecord:
+    year_month: str
+    breakfast: int
+    lunch: int
+    dinner: int
+    amount: int
+
+
+@dataclass
+class SeikyuResult:
+    success: bool
+    records: list[SeikyuRecord] = field(default_factory=list)
+    message: str = ""
+
+
 def _warn_failure(message: str) -> LoginResult:
     warnings.warn(message, RuntimeWarning, stacklevel=3)
     return LoginResult(success=False, message=message)
@@ -46,6 +64,83 @@ def _warn_failure(message: str) -> LoginResult:
 def _warn_auth_failure(message: str) -> AuthResult:
     warnings.warn(message, RuntimeWarning, stacklevel=3)
     return AuthResult(success=False, message=message)
+
+
+def _warn_seikyu_failure(message: str) -> SeikyuResult:
+    warnings.warn(message, RuntimeWarning, stacklevel=3)
+    return SeikyuResult(success=False, message=message)
+
+
+class _SeikyuTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.found_table = False
+        self._in_table = False
+        self._in_tr = False
+        self._in_td = False
+        self._current_row: list[str] = []
+        self._current_cell: list[str] = []
+        self.rows: list[list[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "table" and not self.found_table:
+            self.found_table = True
+            self._in_table = True
+        elif self._in_table and tag == "tr":
+            self._in_tr = True
+            self._current_row = []
+        elif self._in_tr and tag == "td":
+            self._in_td = True
+            self._current_cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._in_table and tag == "table":
+            self._in_table = False
+        elif self._in_tr and tag == "tr":
+            self._in_tr = False
+            if self._current_row:
+                self.rows.append(self._current_row)
+        elif self._in_td and tag == "td":
+            self._in_td = False
+            self._current_row.append("".join(self._current_cell).strip())
+
+    def handle_data(self, data: str) -> None:
+        if self._in_td:
+            self._current_cell.append(data)
+
+
+def _extract_seikyu_records(body: str) -> list[SeikyuRecord] | None:
+    form_re = re.compile(
+        r"<form\b(?=[^>]*\bid\s*=\s*['\"]seikyu['\"])[^>]*>(.*?)</form>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    form_match = form_re.search(body)
+    if not form_match:
+        return None
+
+    parser = _SeikyuTableParser()
+    parser.feed(form_match.group(1))
+    parser.close()
+    if not parser.found_table:
+        return None
+
+    records: list[SeikyuRecord] = []
+    for row in parser.rows:
+        if len(row) != 5:
+            continue
+        ym, morning, noon, evening, price = row
+        records.append(
+            SeikyuRecord(
+                year_month=ym.strip(),
+                breakfast=int(morning.replace(",", "").strip()),
+                lunch=int(noon.replace(",", "").strip()),
+                dinner=int(evening.replace(",", "").strip()),
+                amount=int(re.sub(r"[^\d-]", "", price)),
+            )
+        )
+    return records
 
 
 def _extract_form_values(body: str, form_id: str) -> tuple[str | None, str | None]:
@@ -265,5 +360,49 @@ class Kakuyu:
 
     auth_code = authCode
 
+    def seikyu(self, remember_token: str | None = None) -> SeikyuResult:
+        if remember_token is not None:
+            if not remember_token:
+                raise ValueError("Arg 'remember_token' must not be empty.")
+            self._set_remember_cookie(remember_token)
+        elif not self._get_cookie("remember-me"):
+            return _warn_seikyu_failure(
+                "Remember-me token not found. Please authenticate first or pass remember_token."
+            )
 
-__all__ = ["Kakuyu", "LoginResult", "AuthResult"]
+        try:
+            
+            request = urllib.request.Request(
+                urllib.parse.urljoin(origin, _SEIKYU_INIT_PATH)
+            )
+            with self._opener.open(request) as response:
+                final_url = response.geturl()
+                body = response.read().decode("utf-8")
+
+            if _INIT_PATH in final_url or _extract_form_values(body, "login") != (None, None):
+                return _warn_seikyu_failure(
+                    "Failed to fetch seikyu page: redirected to login page."
+                )
+
+            records = _extract_seikyu_records(body)
+            if records is None:
+                return _warn_seikyu_failure("Failed to find the seikyu form or table.")
+
+            return SeikyuResult(
+                success=True,
+                records=records,
+                message="Fetched seikyu records.",
+            )
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as error:
+            return _warn_seikyu_failure(f"Seikyu request failed: {error}")
+
+    get_seikyu = seikyu
+
+
+__all__ = ["Kakuyu", "LoginResult", "AuthResult", "SeikyuRecord", "SeikyuResult"]
